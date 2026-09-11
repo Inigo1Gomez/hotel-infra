@@ -1,0 +1,75 @@
+# Backend del hotel en una sola máquina (EC2 o local con Docker Desktop).
+# Espera los repositorios clonados al lado de esta carpeta, con estos nombres:
+#   hotel/
+#   ├── hotel-infra/         <- esta carpeta
+#   ├── hotel-ms-usuarios/
+#   └── hotel-ms-reservas/
+name: hotel
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Falta MYSQL_ROOT_PASSWORD en .env}
+      MYSQL_DATABASE: hotel
+      MYSQL_USER: hotel
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Falta MYSQL_PASSWORD en .env}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # Crea las tablas admins y guests la primera vez que arranca el volumen.
+      - ../hotel-ms-usuarios/database.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    # Sin "ports": MySQL solo es accesible desde la red interna de Docker.
+
+  ms-usuarios:
+    build:
+      context: ../hotel-ms-usuarios
+      dockerfile: ../hotel-infra/node-ms.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      PORT: 8082
+      ENTRA_TENANT_ID: ${ENTRA_TENANT_ID:?Falta ENTRA_TENANT_ID en .env}
+      ENTRA_AUDIENCE: ${ENTRA_API_CLIENT_ID:?Falta ENTRA_API_CLIENT_ID en .env}
+      # Por defecto el contenedor "mysql"; para RDS define MYSQL_HOST y MYSQL_USER en .env.
+      MYSQL_HOST: ${MYSQL_HOST:-mysql}
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-hotel}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: hotel
+      COGNITO_ISSUER: ${COGNITO_ISSUER:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+    ports:
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8082/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  ms-reservas:
+    build:
+      context: ../hotel-ms-reservas
+      dockerfile: ../hotel-infra/node-ms.Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: 8081
+      AZURE_TENANT_ID: ${ENTRA_TENANT_ID:?Falta ENTRA_TENANT_ID en .env}
+      AZURE_CLIENT_ID: ${ENTRA_API_CLIENT_ID:?Falta ENTRA_API_CLIENT_ID en .env}
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  mysql-data:
