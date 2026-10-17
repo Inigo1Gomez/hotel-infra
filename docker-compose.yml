@@ -3,7 +3,9 @@
 #   hotel/
 #   ├── hotel-infra/         <- esta carpeta
 #   ├── hotel-ms-usuarios/
-#   └── hotel-ms-reservas/
+#   ├── hotel-ms-reservas/
+#   ├── hotel-ms-notificaciones/
+#   └── hotel-ms-rabbitmq-admin/
 name: hotel
 
 services:
@@ -25,6 +27,30 @@ services:
       timeout: 5s
       retries: 12
     # Sin "ports": MySQL solo es accesible desde la red interna de Docker.
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-hotel}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Falta RABBITMQ_PASSWORD en .env}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      # Panel de administración: http://localhost:15672 (usuario/clave de .env).
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Servidor SMTP de pruebas: recibe los correos con los PDF y los muestra en http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:v1.27
+    restart: unless-stopped
+    ports:
+      - "8025:8025"
 
   ms-usuarios:
     build:
@@ -59,10 +85,15 @@ services:
       context: ../hotel-ms-reservas
       dockerfile: ../hotel-infra/node-ms.Dockerfile
     restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
     environment:
       PORT: 8081
       AZURE_TENANT_ID: ${ENTRA_TENANT_ID:?Falta ENTRA_TENANT_ID en .env}
       AZURE_CLIENT_ID: ${ENTRA_API_CLIENT_ID:?Falta ENTRA_API_CLIENT_ID en .env}
+      # Productor: publica reserva.creada y reporte.solicitado.
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-hotel}:${RABBITMQ_PASSWORD}@rabbitmq:5672
     ports:
       - "8081:8081"
     healthcheck:
@@ -71,5 +102,67 @@ services:
       timeout: 5s
       retries: 3
 
+  # Consumidores: confirmación al huésped, informe del admin (fanout + directo) y listener error (DLQ).
+  ms-notificaciones:
+    build:
+      context: ../hotel-ms-notificaciones
+      dockerfile: ../hotel-infra/node-ms.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      PORT: 8084
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-hotel}:${RABBITMQ_PASSWORD}@rabbitmq:5672
+      MYSQL_HOST: ${MYSQL_HOST:-mysql}
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-hotel}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: hotel
+      # El contenedor corre como "node": /tmp es escribible. Ver PDF: docker compose cp ms-notificaciones:/tmp/hotel/documentos ./documentos
+      DOCUMENTOS_DIR: /tmp/hotel/documentos
+      LOG_DIR: /tmp/hotel/logs
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      # Demo: el aviso del informe falla para emails con este dominio (termina en hotel.dlq).
+      SIMULAR_FALLO_DOMINIO: ${SIMULAR_FALLO_DOMINIO:-@falla.test}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8084/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Administrador de RabbitMQ: POST/DELETE de colas, exchanges y bindings (protegido con Entra ID).
+  ms-rabbitmq-admin:
+    build:
+      context: ../hotel-ms-rabbitmq-admin
+      dockerfile: ../hotel-infra/node-ms.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      PORT: 8083
+      ENTRA_TENANT_ID: ${ENTRA_TENANT_ID:?Falta ENTRA_TENANT_ID en .env}
+      ENTRA_AUDIENCE: ${ENTRA_API_CLIENT_ID:?Falta ENTRA_API_CLIENT_ID en .env}
+      ENTRA_EXIGIR_ROL: ${ENTRA_EXIGIR_ROL:-true}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-hotel}:${RABBITMQ_PASSWORD}@rabbitmq:5672
+      RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
+      RABBITMQ_USER: ${RABBITMQ_USER:-hotel}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8083/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
 volumes:
   mysql-data:
+  rabbitmq-data:
