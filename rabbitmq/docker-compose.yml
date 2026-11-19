@@ -1,0 +1,53 @@
+# Clúster de RabbitMQ con 2 nodos (lo que pide la guía del EFT).
+#
+# Solo RabbitMQ:     docker compose -f rabbitmq/docker-compose.yml up -d
+# Todo el sistema:   docker compose up -d   (el docker-compose.yml de hotel-infra incluye este archivo)
+#
+# Los microservicios siguen conectándose a "rabbitmq:5672": es un alias del nodo 1.
+# Panel de management: http://localhost:15672 (muestra los 2 nodos en Overview → Nodes).
+
+x-rabbitmq-node: &rabbitmq-node
+  image: rabbitmq:4.1-management-alpine
+  restart: unless-stopped
+  mem_limit: 512m
+  environment:
+    RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-hotel}
+    RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Falta RABBITMQ_PASSWORD en .env}
+    # Los nodos solo se unen si comparten la misma cookie de Erlang (también la usan rabbitmqctl y el healthcheck).
+    RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: -setcookie ${RABBITMQ_ERLANG_COOKIE:?Falta RABBITMQ_ERLANG_COOKIE en .env}
+    RABBITMQ_CTL_ERL_ARGS: -setcookie ${RABBITMQ_ERLANG_COOKIE}
+  healthcheck:
+    test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+    interval: 10s
+    timeout: 10s
+    retries: 12
+    start_period: 20s
+
+services:
+  rabbitmq-1:
+    <<: *rabbitmq-node
+    hostname: rabbitmq-1
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/20-cluster.conf:ro
+      - rabbitmq-1-data:/var/lib/rabbitmq
+    networks:
+      default:
+        aliases:
+          - rabbitmq
+    ports:
+      - "15672:15672"
+
+  rabbitmq-2:
+    <<: *rabbitmq-node
+    hostname: rabbitmq-2
+    # Arranca cuando el nodo 1 ya está listo, para unirse a su clúster.
+    depends_on:
+      rabbitmq-1:
+        condition: service_healthy
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/20-cluster.conf:ro
+      - rabbitmq-2-data:/var/lib/rabbitmq
+
+volumes:
+  rabbitmq-1-data:
+  rabbitmq-2-data:

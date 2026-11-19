@@ -5,8 +5,23 @@
 #   ├── hotel-ms-usuarios/
 #   ├── hotel-ms-reservas/
 #   ├── hotel-ms-notificaciones/
-#   └── hotel-ms-rabbitmq-admin/
+#   ├── hotel-ms-rabbitmq-admin/
+#   ├── hotel-ms-reportes/
+#   ├── hotel-ms-auditoria/
+#   ├── hotel-ms-kafka-admin/
+#   └── hotel-ms-catalogo/
+#
+# Este archivo levanta los microservicios, MySQL y Mailpit, e incluye los otros dos:
+#   rabbitmq/docker-compose.yml   clúster de RabbitMQ (2 nodos)
+#   kafka/docker-compose.yml      3 Zookeeper, 3 brokers de Kafka y Kafka-UI
+# Cada uno también se puede levantar por separado: docker compose -f kafka/docker-compose.yml up -d
 name: hotel
+
+include:
+  - path: rabbitmq/docker-compose.yml
+    env_file: .env
+  - path: kafka/docker-compose.yml
+    env_file: .env
 
 services:
   mysql:
@@ -27,23 +42,6 @@ services:
       timeout: 5s
       retries: 12
     # Sin "ports": MySQL solo es accesible desde la red interna de Docker.
-
-  rabbitmq:
-    image: rabbitmq:4.1-management-alpine
-    restart: unless-stopped
-    environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-hotel}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Falta RABBITMQ_PASSWORD en .env}
-    volumes:
-      - rabbitmq-data:/var/lib/rabbitmq
-    ports:
-      # Panel de administración: http://localhost:15672 (usuario/clave de .env).
-      - "15672:15672"
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
 
   # Servidor SMTP de pruebas: recibe los correos con los PDF y los muestra en http://localhost:8025
   mailpit:
@@ -86,14 +84,31 @@ services:
       dockerfile: ../hotel-infra/node-ms.Dockerfile
     restart: unless-stopped
     depends_on:
-      rabbitmq:
+      rabbitmq-1:
+        condition: service_healthy
+      mysql:
         condition: service_healthy
     environment:
       PORT: 8081
       AZURE_TENANT_ID: ${ENTRA_TENANT_ID:?Falta ENTRA_TENANT_ID en .env}
       AZURE_CLIENT_ID: ${ENTRA_API_CLIENT_ID:?Falta ENTRA_API_CLIENT_ID en .env}
-      # Productor: publica reserva.creada y reporte.solicitado.
+      # Rutas internas de reservas: exigen el app role ADMIN o EMPLOYEE, salvo que sea "false".
+      ENTRA_EXIGIR_ROL: ${ENTRA_EXIGIR_ROL:-true}
+      # Rutas /cliente/reservas: access_token de Cognito (huésped registrado, grupo CLIENTE).
+      COGNITO_ISSUER: ${COGNITO_ISSUER:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+      COGNITO_EXIGIR_GRUPO: ${COGNITO_EXIGIR_GRUPO:-true}
+      # Las reservas se guardan en la tabla "reservas" (la crea el microservicio al arrancar).
+      MYSQL_HOST: ${MYSQL_HOST:-mysql}
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-hotel}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: hotel
+      # Productor RabbitMQ (comandos): publica reserva.creada y reporte.solicitado.
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-hotel}:${RABBITMQ_PASSWORD}@rabbitmq:5672
+      # Productor Kafka (eventos): crea los tópicos "reservas" y "reservas.DLT" y publica el ciclo de vida.
+      # Sin depends_on: si Kafka tarda en arrancar, el servicio reintenta solo y las reservas siguen funcionando.
+      KAFKA_BROKERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
     ports:
       - "8081:8081"
     healthcheck:
@@ -109,7 +124,7 @@ services:
       dockerfile: ../hotel-infra/node-ms.Dockerfile
     restart: unless-stopped
     depends_on:
-      rabbitmq:
+      rabbitmq-1:
         condition: service_healthy
       mysql:
         condition: service_healthy
@@ -129,7 +144,7 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_SECURE: ${SMTP_SECURE:-false}
-      # Demo: el aviso del informe falla para emails con este dominio (termina en hotel.dlq).
+      # Demo: el aviso del informe falla para emails con este dominio (termina en hotel.reportes.aviso.queue.dlq).
       SIMULAR_FALLO_DOMINIO: ${SIMULAR_FALLO_DOMINIO:-@falla.test}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8084/health"]
@@ -144,7 +159,7 @@ services:
       dockerfile: ../hotel-infra/node-ms.Dockerfile
     restart: unless-stopped
     depends_on:
-      rabbitmq:
+      rabbitmq-1:
         condition: service_healthy
     environment:
       PORT: 8083
@@ -163,6 +178,115 @@ services:
       timeout: 5s
       retries: 3
 
+  # Consumidor Kafka (grupo "reportes", concurrency 3): KPIs de reservas en tiempo real. Solo Admin.
+  ms-reportes:
+    build:
+      context: ../hotel-ms-reportes
+      dockerfile: ../hotel-infra/node-ms.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      PORT: 8086
+      KAFKA_BROKERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+      KAFKA_CONCURRENCIA: ${KAFKA_CONCURRENCIA_REPORTES:-3}
+      # Demo: las reservas de esta habitación fallan 3 veces y terminan en reservas.DLT.
+      SIMULAR_FALLO_HABITACION: ${SIMULAR_FALLO_HABITACION:-HAB-FALLA}
+      MYSQL_HOST: ${MYSQL_HOST:-mysql}
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-hotel}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: hotel
+      ENTRA_TENANT_ID: ${ENTRA_TENANT_ID:?Falta ENTRA_TENANT_ID en .env}
+      ENTRA_AUDIENCE: ${ENTRA_API_CLIENT_ID:?Falta ENTRA_API_CLIENT_ID en .env}
+      ENTRA_EXIGIR_ROL: ${ENTRA_EXIGIR_ROL:-true}
+    ports:
+      - "8086:8086"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8086/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Consumidor Kafka (grupo "auditoria"): quién hizo qué, cuándo y desde dónde. Solo Admin.
+  ms-auditoria:
+    build:
+      context: ../hotel-ms-auditoria
+      dockerfile: ../hotel-infra/node-ms.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      PORT: 8087
+      KAFKA_BROKERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+      KAFKA_CONCURRENCIA: ${KAFKA_CONCURRENCIA_AUDITORIA:-1}
+      MYSQL_HOST: ${MYSQL_HOST:-mysql}
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-hotel}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: hotel
+      ENTRA_TENANT_ID: ${ENTRA_TENANT_ID:?Falta ENTRA_TENANT_ID en .env}
+      ENTRA_AUDIENCE: ${ENTRA_API_CLIENT_ID:?Falta ENTRA_API_CLIENT_ID en .env}
+      ENTRA_EXIGIR_ROL: ${ENTRA_EXIGIR_ROL:-true}
+    ports:
+      - "8087:8087"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8087/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Administrador de Kafka: tópicos, configuraciones (retention, cleanup policy...), particiones,
+  # consumer groups, offsets y lag. Protegido con Entra ID (rol ADMIN).
+  ms-kafka-admin:
+    build:
+      context: ../hotel-ms-kafka-admin
+      dockerfile: ../hotel-infra/node-ms.Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: 8085
+      KAFKA_BROKERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+      ENTRA_TENANT_ID: ${ENTRA_TENANT_ID:?Falta ENTRA_TENANT_ID en .env}
+      ENTRA_AUDIENCE: ${ENTRA_API_CLIENT_ID:?Falta ENTRA_API_CLIENT_ID en .env}
+      ENTRA_EXIGIR_ROL: ${ENTRA_EXIGIR_ROL:-true}
+    ports:
+      - "8085:8085"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8085/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Catálogo (entidad secundaria): hoteles y habitaciones. Lectura pública, edición solo Admin.
+  # Produce el tópico "catalogo" (compactado) y reacciona a "reservas" (grupo "disponibilidad").
+  ms-catalogo:
+    build:
+      context: ../hotel-ms-catalogo
+      dockerfile: ../hotel-infra/node-ms.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      PORT: 8088
+      KAFKA_BROKERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+      MYSQL_HOST: ${MYSQL_HOST:-mysql}
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-hotel}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: hotel
+      ENTRA_TENANT_ID: ${ENTRA_TENANT_ID:?Falta ENTRA_TENANT_ID en .env}
+      ENTRA_AUDIENCE: ${ENTRA_API_CLIENT_ID:?Falta ENTRA_API_CLIENT_ID en .env}
+      ENTRA_EXIGIR_ROL: ${ENTRA_EXIGIR_ROL:-true}
+    ports:
+      - "8088:8088"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8088/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
 volumes:
   mysql-data:
-  rabbitmq-data:

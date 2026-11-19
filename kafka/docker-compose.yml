@@ -1,0 +1,154 @@
+# Kafka con 3 Zookeeper, 3 brokers y Kafka-UI.
+# Mismas imágenes que el demo del curso (demo-kafka), pero en clúster:
+# - 3 brokers: cada partición tiene un líder y dos réplicas; si se cae un broker, otro toma el liderazgo.
+# - 3 Zookeeper (ensemble): siguen coordinando el clúster aunque se caiga uno, porque quedan 2 de 3 (mayoría).
+#
+# Solo Kafka:        docker compose -f kafka/docker-compose.yml up -d
+# Todo el sistema:   docker compose up -d   (el docker-compose.yml de hotel-infra incluye este archivo)
+#
+# Dentro de Docker los servicios usan kafka-1:29092,kafka-2:29092,kafka-3:29092.
+# Desde el computador (desarrollo local): localhost:9092, localhost:9093 y localhost:9094.
+
+x-kafka-broker: &kafka-broker
+  image: confluentinc/cp-kafka:7.5.0
+  restart: unless-stopped
+  depends_on:
+    - zookeeper-1
+    - zookeeper-2
+    - zookeeper-3
+  mem_limit: 768m
+  healthcheck:
+    test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+    interval: 15s
+    timeout: 10s
+    retries: 10
+    start_period: 30s
+
+x-zookeeper: &zookeeper
+  image: confluentinc/cp-zookeeper:7.5.0
+  restart: unless-stopped
+  mem_limit: 256m
+  # Sin "ports": solo los brokers hablan con Zookeeper.
+
+x-zookeeper-env: &zookeeper-env
+  ZOOKEEPER_CLIENT_PORT: 2181
+  ZOOKEEPER_TICK_TIME: 2000
+  ZOOKEEPER_INIT_LIMIT: 5
+  ZOOKEEPER_SYNC_LIMIT: 2
+  # Los 3 nodos del ensemble: puerto 2888 para seguir al líder y 3888 para elegirlo.
+  ZOOKEEPER_SERVERS: zookeeper-1:2888:3888;zookeeper-2:2888:3888;zookeeper-3:2888:3888
+  KAFKA_HEAP_OPTS: "-Xms96m -Xmx160m"
+
+x-kafka-env: &kafka-env
+  KAFKA_ZOOKEEPER_CONNECT: zookeeper-1:2181,zookeeper-2:2181,zookeeper-3:2181
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  # Con 3 brokers, los tópicos internos (offsets de los consumer groups) también quedan replicados.
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  # Valores por defecto para los tópicos; cada microservicio crea los suyos con su propia configuración.
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_NUM_PARTITIONS: 3
+  # 168 horas = 7 días, igual que el broker del demo (guía 3.3.1).
+  KAFKA_LOG_RETENTION_HOURS: 168
+  # Los tópicos los crean los microservicios al arrancar, con sus particiones y configs: no se crean solos por error.
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_HEAP_OPTS: "-Xms384m -Xmx384m"
+
+services:
+  zookeeper-1:
+    <<: *zookeeper
+    environment:
+      <<: *zookeeper-env
+      ZOOKEEPER_SERVER_ID: 1
+    volumes:
+      - zookeeper-1-data:/var/lib/zookeeper/data
+      - zookeeper-1-log:/var/lib/zookeeper/log
+
+  zookeeper-2:
+    <<: *zookeeper
+    environment:
+      <<: *zookeeper-env
+      ZOOKEEPER_SERVER_ID: 2
+    volumes:
+      - zookeeper-2-data:/var/lib/zookeeper/data
+      - zookeeper-2-log:/var/lib/zookeeper/log
+
+  zookeeper-3:
+    <<: *zookeeper
+    environment:
+      <<: *zookeeper-env
+      ZOOKEEPER_SERVER_ID: 3
+    volumes:
+      - zookeeper-3-data:/var/lib/zookeeper/data
+      - zookeeper-3-log:/var/lib/zookeeper/log
+
+  kafka-1:
+    <<: *kafka-broker
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+    ports:
+      - "127.0.0.1:9092:9092"
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+
+  kafka-2:
+    <<: *kafka-broker
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:29092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9093
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+
+  kafka-3:
+    <<: *kafka-broker
+    environment:
+      <<: *kafka-env
+      KAFKA_BROKER_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:29092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9094
+    ports:
+      - "127.0.0.1:9094:9094"
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
+
+  # Página para ver tópicos, particiones, mensajes, consumer groups y lag: http://localhost:8080
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    restart: unless-stopped
+    mem_limit: 512m
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: hotel
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper-1:2181,zookeeper-2:2181,zookeeper-3:2181
+    ports:
+      - "8080:8080"
+
+# Con volúmenes, "docker compose down" no borra los tópicos (la guía 3.3.1 advierte que el demo sí los pierde).
+# Para empezar de cero: docker compose down -v
+volumes:
+  zookeeper-1-data:
+  zookeeper-1-log:
+  zookeeper-2-data:
+  zookeeper-2-log:
+  zookeeper-3-data:
+  zookeeper-3-log:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
